@@ -1,0 +1,852 @@
+#!/usr/bin/env python3
+"""
+agy-loop: Claude plans, Gemini (Antigravity CLI) executes, Claude reviews.
+
+One iteration per `step` call, because the reviewer wants to look between rounds.
+All state lives under ~/.agy-loop (override with AGY_LOOP_HOME).
+
+Exit codes for `step`:
+  0  Gemini reported done and verification passed (ready for review)
+  2  verification failed
+  3  Gemini reported partial/blocked
+  4  harness or CLI error
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+__version__ = "1.0.0"
+
+HOME = Path(os.environ.get("AGY_LOOP_HOME", Path.home() / ".agy-loop"))
+TASKS = HOME / "tasks"
+SANDBOXES = HOME / "sandboxes"
+DEFAULT_MODEL = os.environ.get("AGY_LOOP_MODEL", "gemini-3.8-flash-high")
+
+# Where the Antigravity CLI tends to land. The official installer uses
+# ~/.local/bin; some builds use ~/.gemini/bin. AGY_BIN always wins, then PATH.
+AGY_CANDIDATES = [
+    Path.home() / ".local" / "bin" / "agy",
+    Path.home() / ".gemini" / "bin" / "agy",
+    Path("/usr/local/bin/agy"),
+    Path("/opt/homebrew/bin/agy"),
+]
+_AGY_RESOLVED: str | None = None
+
+DEFAULT_MAX_ITER = 8
+DIFF_CAP = 300
+VERIFY_TAIL = 40
+COPY_EXCLUDES = [
+    ".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
+    ".next", "dist", "build", "target", ".turbo", ".DS_Store", ".mypy_cache",
+]
+
+REPORT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["done", "partial", "blocked"]},
+        "summary": {"type": "string"},
+        "files_changed": {"type": "array", "items": {"type": "string"}},
+        "commands_run": {"type": "array", "items": {"type": "string"}},
+        "self_check": {"type": "string"},
+        "questions": {"type": "array", "items": {"type": "string"}},
+        "decisions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["status", "summary", "files_changed", "commands_run", "self_check"],
+}
+
+RECON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "stack": {"type": "array", "items": {"type": "string"}},
+        "layout": {"type": "array", "items": {"type": "string"}},
+        "entrypoints": {"type": "array", "items": {"type": "string"}},
+        "test_command": {"type": "string"},
+        "risky_areas": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["summary", "stack", "layout", "test_command"],
+}
+
+BRIEF_TEMPLATE = """# Brief: {slug}
+
+## Goal
+<!-- One paragraph. Define what "done" looks like in observable terms. -->
+
+## Scope
+- In scope:
+- Out of scope:
+
+## Acceptance criteria
+<!-- Each line must be checkable by a stranger, not a vibe. -->
+- [ ]
+- [ ]
+
+## Constraints
+- Language / framework:
+- Do not touch:
+- Convention to follow:
+
+## Verification
+<!-- Optional: commands that prove it works. If you add them, also write verify.sh
+     next to this file and `agy-loop` will gate every iteration on it. -->
+"""
+
+VERIFY_TEMPLATE = """#!/usr/bin/env bash
+# Deterministic gate for this task. Exit 0 = pass.
+# agy-loop runs this in the sandbox after every Gemini iteration.
+set -uo pipefail
+
+# Example:
+# npm test --silent
+# python3 -m pytest -q
+# tsc --noEmit
+
+echo "no verification configured" >&2
+exit 0
+"""
+
+
+# ---------------------------------------------------------------- utilities
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def die(msg: str, code: int = 4) -> "None":
+    print(f"agy-loop: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def resolve_agy() -> str:
+    """Locate the Antigravity CLI: AGY_BIN, then PATH, then known install dirs."""
+    global _AGY_RESOLVED
+    if _AGY_RESOLVED:
+        return _AGY_RESOLVED
+
+    env = os.environ.get("AGY_BIN")
+    if env:
+        p = Path(env).expanduser()
+        if not p.exists():
+            die(f"AGY_BIN points at {p}, which does not exist")
+        _AGY_RESOLVED = str(p)
+        return _AGY_RESOLVED
+
+    found = shutil.which("agy")
+    if found:
+        _AGY_RESOLVED = found
+        return _AGY_RESOLVED
+
+    for cand in AGY_CANDIDATES:
+        if cand.exists():
+            _AGY_RESOLVED = str(cand)
+            return _AGY_RESOLVED
+
+    die("Antigravity CLI (`agy`) not found.\n"
+        "  install it:      curl -fsSL https://antigravity.google/cli/install.sh | bash\n"
+        "  or point at it:  export AGY_BIN=/path/to/agy")
+
+
+def sh(args, cwd=None, timeout=900, check=False):
+    try:
+        return subprocess.run(
+            args, cwd=str(cwd) if cwd else None, timeout=timeout,
+            capture_output=True, text=True, errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        die(f"timed out after {timeout}s: {' '.join(str(a) for a in args)}")
+    except FileNotFoundError:
+        die(f"not found: {args[0]}")
+
+
+def git(repo, *args, check=False):
+    return sh(["git", "-C", str(repo), *args], check=check)
+
+
+def is_git_repo(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    r = git(path, "rev-parse", "--is-inside-work-tree")
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def has_head(repo: Path) -> bool:
+    return git(repo, "rev-parse", "--verify", "HEAD").returncode == 0
+
+
+def task_dir(slug: str) -> Path:
+    return TASKS / slug
+
+
+def state_path(slug: str) -> Path:
+    return task_dir(slug) / "state.json"
+
+
+def load_state(slug: str) -> dict:
+    p = state_path(slug)
+    if not p.exists():
+        die(f"no such task: {slug} (try `agy-loop list`)")
+    return json.loads(p.read_text())
+
+
+def save_state(slug: str, state: dict) -> None:
+    state_path(slug).write_text(json.dumps(state, indent=2) + "\n")
+
+
+def tail(text: str, lines: int) -> str:
+    parts = text.rstrip("\n").splitlines()
+    if len(parts) <= lines:
+        return "\n".join(parts)
+    return "\n".join(["… (truncated)"] + parts[-lines:])
+
+
+def slugify(s: str) -> str:
+    out = "".join(c if c.isalnum() or c in "-_." else "-" for c in s.strip().lower())
+    while "--" in out:
+        out = out.replace("--", "-")
+    return out.strip("-") or f"task-{int(time.time())}"
+
+
+def dirty_files(repo: Path):
+    """Paths changed against HEAD, plus untracked-but-not-ignored files."""
+    changed = sh(["git", "-C", str(repo), "diff", "--name-only", "-z", "HEAD"]).stdout
+    untracked = sh(["git", "-C", str(repo), "ls-files", "--others",
+                    "--exclude-standard", "-z"]).stdout
+    return ([p for p in changed.split("\0") if p],
+            [p for p in untracked.split("\0") if p])
+
+
+def copy_working_changes(source: Path, sandbox: Path, changed, untracked) -> int:
+    n = 0
+    for rel in list(changed) + list(untracked):
+        src, dst = source / rel, sandbox / rel
+        if src.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            n += 1
+        elif dst.exists():
+            dst.unlink()
+            n += 1
+    return n
+
+
+def link_deps(source: Path, sandbox: Path) -> list[str]:
+    linked = []
+    for name in ("node_modules", ".venv", "venv"):
+        src, dst = source / name, sandbox / name
+        if src.exists() and not dst.exists():
+            try:
+                os.symlink(src.resolve(), dst, target_is_directory=src.is_dir())
+                linked.append(name)
+            except OSError:
+                pass
+    return linked
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_new(args) -> int:
+    slug = slugify(args.slug)
+    tdir = task_dir(slug)
+    if tdir.exists():
+        die(f"task already exists: {slug}")
+
+    source = Path(args.source).expanduser().resolve()
+    if not source.is_dir():
+        die(f"source is not a directory: {source}")
+
+    sbx = SANDBOXES / slug
+    if sbx.exists():
+        die(f"sandbox already exists: {sbx}")
+
+    SANDBOXES.mkdir(parents=True, exist_ok=True)
+    tdir.mkdir(parents=True)
+
+    mode = "copy"
+    branch = None
+    if is_git_repo(source) and has_head(source) and not args.force_copy:
+        branch = f"agy/{slug}"
+        r = git(source, "worktree", "add", "-b", branch, str(sbx), "HEAD")
+        if r.returncode != 0:
+            die(f"worktree creation failed:\n{r.stderr}")
+        mode = "worktree"
+        # worktrees only contain tracked files; make the starting diff explicit
+        git(sbx, "add", "-A")
+    else:
+        sh(["rsync", "-a", *sum([["--exclude", e] for e in COPY_EXCLUDES], []),
+            str(source) + "/", str(sbx) + "/"])
+        git(sbx, "init", "-q")
+        git(sbx, "config", "user.email", "agy-loop@local")
+        git(sbx, "config", "user.name", "agy-loop")
+        git(sbx, "add", "-A")
+        git(sbx, "commit", "-qm", "agy-loop: baseline")
+        branch = git(sbx, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+
+    if mode == "worktree":
+        changed, untracked = dirty_files(source)
+        if changed or untracked:
+            if args.include_dirty:
+                n = copy_working_changes(source, sbx, changed, untracked)
+                print(f"copied {n} uncommitted path(s) into the sandbox")
+            else:
+                print(f"warning: {len(changed) + len(untracked)} uncommitted path(s) "
+                      "are missing from the worktree (it starts at HEAD). "
+                      "Pass --include-dirty to copy them.", file=sys.stderr)
+
+    linked = [] if args.no_link_deps else link_deps(source, sbx)
+
+    (tdir / "brief.md").write_text(BRIEF_TEMPLATE.format(slug=slug))
+    (tdir / "feedback.jsonl").write_text("")
+    (tdir / "ledger.jsonl").write_text("")
+    (tdir / "history").mkdir()
+
+    state = {
+        "slug": slug,
+        "source": str(source),
+        "sandbox": str(sbx),
+        "mode": mode,
+        "branch": branch,
+        "model": args.model or DEFAULT_MODEL,
+        "max_iter": args.max_iter,
+        "iteration": 0,
+        "conversation_id": None,
+        "status": "new",
+        "created": now_iso(),
+        "tokens": {"total": 0, "input": 0, "output": 0, "thinking": 0},
+        "linked_deps": linked,
+    }
+    save_state(slug, state)
+
+    print(f"task:    {slug}")
+    print(f"sandbox: {sbx}")
+    print(f"mode:    {mode}" + (f" (branch {branch})" if branch else ""))
+    if linked:
+        print(f"linked:  {', '.join(linked)}")
+    print(f"\nnext: write {tdir/'brief.md'}, then `agy-loop step {slug}`")
+    return 0
+
+
+def build_prompt(state: dict, brief: str, rubric: str, feedback: list[dict],
+                 prev_verify: str) -> str:
+    parts = [
+        "You are the implementation worker in a two-agent setup. Claude planned "
+        "this task and will review your output after every iteration.",
+        "",
+        "Work autonomously. Do NOT ask the user anything: pick a reasonable "
+        "default, do it, and record the choice under `decisions`.",
+        "",
+        "## Task",
+        brief.strip(),
+        "",
+    ]
+    if rubric.strip():
+        parts += ["## Extra acceptance detail", rubric.strip(), ""]
+
+    parts += [
+        f"## Iteration {state['iteration'] + 1} of {state['max_iter']}",
+        "",
+    ]
+
+    if feedback:
+        parts += ["## Reviewer feedback on previous attempt", ""]
+        for f in feedback:
+            parts.append(f"- (iter {f['iteration']}) {f['text'].strip()}")
+        parts.append("")
+
+    if prev_verify:
+        parts += ["## Previous verification output (you must fix this)", "",
+                  "```", prev_verify.strip(), "```", ""]
+
+    parts += [
+        "## Rules",
+        "- Work only inside the current directory.",
+        "- Never modify brief.md, rubric.md, verify.sh, or anything under .agy-loop.",
+        "- Run the project's own checks (tests, typecheck, lint) yourself before reporting.",
+        "- Do not run `git commit`; the harness commits when the reviewer accepts.",
+        "- Report every file you touched as a path relative to the working directory.",
+        "- `self_check` must state what you actually ran and what it printed.",
+        "- If something is genuinely impossible, set status=blocked and explain why.",
+        "",
+    ]
+    return "\n".join(parts)
+
+
+def call_agy(state: dict, prompt: str, schema_path: Path, timeout: int,
+             resume: bool = False) -> dict:
+    base = [
+        resolve_agy(),
+        f"--print={prompt}",
+        "--output-format", "json",
+        "--json-schema", str(schema_path),
+        "--model", state["model"],
+        "--dangerously-skip-permissions",
+        # skills and slash commands are expanded into every print-mode prompt;
+        # disabling them roughly halves the fixed per-call token overhead.
+        "--disable-slash-commands",
+    ]
+    if state.get("sandboxed", True):
+        base.append("--sandbox")
+
+    attempts = []
+    if resume and state.get("conversation_id"):
+        attempts.append(["--conversation", state["conversation_id"]])
+    attempts.append([])  # fresh turn fallback
+
+    last = None
+    for extra in attempts:
+        r = sh(base + extra, cwd=state["sandbox"], timeout=timeout)
+        last = r
+        out = (r.stdout or "").strip()
+        if r.returncode != 0:
+            continue
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            # CLI may prefix noise; take the last JSON object line
+            data = None
+            for line in reversed(out.splitlines()):
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        data = json.loads(line)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            if data is None:
+                continue
+        if data.get("status") == "ERROR":
+            continue
+        return data
+
+    stderr = (last.stderr or "").strip() if last else ""
+    die(f"agy failed (exit {last.returncode if last else '?'}):\n{stderr[:2000]}")
+
+
+def cmd_step(args) -> int:
+    state = load_state(args.slug)
+    tdir = task_dir(args.slug)
+    sbx = Path(state["sandbox"])
+
+    brief_p = tdir / "brief.md"
+    if not brief_p.exists():
+        die("brief.md missing")
+    brief = brief_p.read_text()
+    if "<!-- One paragraph." in brief and brief.count("- [ ]") >= 1 and len(brief) < 700:
+        print("warning: brief.md still looks like the template; results may be vague",
+              file=sys.stderr)
+
+    rubric_p = tdir / "rubric.md"
+    rubric = rubric_p.read_text() if rubric_p.exists() else ""
+
+    fb = [json.loads(l) for l in (tdir / "feedback.jsonl").read_text().splitlines() if l.strip()]
+    pending = [f for f in fb if not f.get("consumed")]
+    prev_verify_p = tdir / "history" / f"iter-{max(0, state['iteration'] - 1):02d}-verify.log"
+    prev_verify = prev_verify_p.read_text() if prev_verify_p.exists() else ""
+
+    if state["iteration"] >= state["max_iter"]:
+        print(f"iteration cap reached ({state['max_iter']}). Accept, or raise it with "
+              f"`agy-loop config {args.slug} --max-iter N`.", file=sys.stderr)
+        return 3
+
+    if args.model:
+        state["model"] = args.model
+    if args.no_sandbox:
+        state["sandboxed"] = False
+    state.setdefault("sandboxed", True)
+
+    schema_path = tdir / "report-schema.json"
+    schema_path.write_text(json.dumps(REPORT_SCHEMA, indent=2))
+
+    prompt = build_prompt(state, brief, rubric, pending, prev_verify)
+    (tdir / "history" / f"iter-{state['iteration']:02d}-prompt.md").write_text(prompt)
+
+    print(f"[{args.slug}] iteration {state['iteration'] + 1}/{state['max_iter']} "
+          f"on {state['model']} …", file=sys.stderr)
+    t0 = time.time()
+    data = call_agy(state, prompt, schema_path, args.timeout, resume=args.resume)
+    elapsed = time.time() - t0
+
+    report = data.get("structured_output") or {}
+    if not report:
+        try:
+            report = json.loads(data.get("response", "{}"))
+        except json.JSONDecodeError:
+            report = {"status": "blocked", "summary": data.get("response", ""),
+                      "files_changed": [], "commands_run": [], "self_check": ""}
+
+    usage = data.get("usage", {}) or {}
+    state["conversation_id"] = data.get("conversation_id", state.get("conversation_id"))
+    for k_src, k_dst in (("total_tokens", "total"), ("input_tokens", "input"),
+                         ("output_tokens", "output"), ("thinking_tokens", "thinking")):
+        state["tokens"][k_dst] = state["tokens"].get(k_dst, 0) + int(usage.get(k_src, 0) or 0)
+
+    # ---- verification (deterministic, no Claude tokens)
+    verify_p = tdir / "verify.sh"
+    verify_exit = None
+    verify_log = ""
+    if verify_p.exists() and not args.skip_verify:
+        r = sh(["bash", str(verify_p)], cwd=sbx, timeout=args.verify_timeout)
+        verify_exit = r.returncode
+        verify_log = (r.stdout + "\n" + r.stderr).strip()
+        (tdir / "history" / f"iter-{state['iteration']:02d}-verify.log").write_text(
+            f"exit={verify_exit}\n\n{verify_log}\n")
+
+    # ---- diff
+    git(sbx, "add", "-A", "-N")  # let untracked files appear in diff
+    stat = git(sbx, "diff", "--stat").stdout.strip()
+    patch = git(sbx, "diff", "--no-color", "--unified=3").stdout
+    patch_lines = patch.splitlines()
+    cap = args.max_diff
+    truncated = len(patch_lines) > cap
+    shown = "\n".join(patch_lines[:cap])
+
+    iter_no = state["iteration"]
+    (tdir / "history" / f"iter-{iter_no:02d}-report.json").write_text(
+        json.dumps({"report": report, "usage": usage, "raw_status": data.get("status")},
+                   indent=2) + "\n")
+    (tdir / "history" / f"iter-{iter_no:02d}-diff.patch").write_text(patch)
+
+    with (tdir / "ledger.jsonl").open("a") as fh:
+        fh.write(json.dumps({
+            "ts": now_iso(), "iter": iter_no, "model": state["model"],
+            "total": usage.get("total_tokens", 0),
+            "input": usage.get("input_tokens", 0),
+            "output": usage.get("output_tokens", 0),
+            "thinking": usage.get("thinking_tokens", 0),
+            "seconds": round(elapsed, 1),
+            "verify_exit": verify_exit,
+        }) + "\n")
+
+    # ---- review packet
+    verdict_bits = []
+    if verify_exit is None:
+        verdict_bits.append("no verify.sh (review decides)")
+    else:
+        verdict_bits.append(f"verify {'PASS' if verify_exit == 0 else f'FAIL (exit {verify_exit})'}")
+    verdict_bits.append(f"gemini status={report.get('status', '?')}")
+
+    lines = [
+        f"# Review packet: {args.slug}, iteration {iter_no + 1}/{state['max_iter']}",
+        "",
+        f"**Gate:** {' · '.join(verdict_bits)}",
+        f"**Sandbox:** `{sbx}`  ·  **branch:** `{state.get('branch') or '-'}`",
+        "",
+        "## Gemini report",
+        "",
+        f"- **summary:** {report.get('summary', '').strip()}",
+        f"- **self_check:** {report.get('self_check', '').strip()}",
+    ]
+    files = report.get("files_changed") or []
+    if files:
+        lines.append(f"- **files:** {', '.join(f'`{f}`' for f in files)}")
+    cmds = report.get("commands_run") or []
+    if cmds:
+        lines.append(f"- **commands:** {', '.join(f'`{c}`' for c in cmds)}")
+    qs = report.get("questions") or []
+    if qs:
+        lines += ["- **questions:**"] + [f"  - {q}" for q in qs]
+    decisions = report.get("decisions") or []
+    if decisions:
+        lines += ["- **decisions:**"] + [f"  - {d}" for d in decisions]
+
+    if verify_exit is not None:
+        lines += ["", "## Verification", "", "```",
+                  tail(verify_log, VERIFY_TAIL) or "(no output)", "```"]
+
+    lines += ["", "## Diff stat", "", "```",
+              stat or "(no changes on disk)", "```"]
+
+    if patch.strip():
+        lines += ["", f"## Diff (showing {min(cap, len(patch_lines))} of "
+                      f"{len(patch_lines)} lines)", "", "```diff", shown, "```"]
+        if truncated:
+            lines += ["",
+                      f"_{len(patch_lines) - cap} lines elided. Pull one file with "
+                      f"`agy-loop show {args.slug} <path>` rather than reading the rest._"]
+    else:
+        lines += ["", "_No diff: Gemini changed nothing on disk._"]
+
+    lines += ["",
+              f"**Spend:** {usage.get('total_tokens', 0):,} tokens this iteration · "
+              f"{state['tokens']['total']:,} total Gemini tokens · "
+              f"{elapsed:.0f}s"]
+
+    packet = tdir / f"review-{iter_no + 1:02d}.md"
+    packet.write_text("\n".join(lines) + "\n")
+
+    # ---- bookkeeping
+    for f in pending:
+        f["consumed"] = True
+    (tdir / "feedback.jsonl").write_text(
+        "".join(json.dumps(f) + "\n" for f in fb))
+
+    state["iteration"] = iter_no + 1
+    status = report.get("status", "blocked")
+    if verify_exit not in (None, 0) or status != "done":
+        state["status"] = "needs_review"
+    else:
+        state["status"] = "passed"
+    save_state(args.slug, state)
+
+    print(f"\nwrote {packet}")
+    print(f"gate: {'PASS' if (verify_exit in (None, 0) and status == 'done') else 'CHECK'} "
+          f"· tokens {usage.get('total_tokens', 0):,} · {elapsed:.0f}s")
+
+    if status == "blocked":
+        return 3
+    if verify_exit not in (None, 0):
+        return 2
+    return 0
+
+
+def cmd_feedback(args) -> int:
+    tdir = task_dir(args.slug)
+    state = load_state(args.slug)
+    text = args.text
+    if args.file:
+        text = Path(args.file).expanduser().read_text()
+    if not text or not text.strip():
+        die("empty feedback")
+    with (tdir / "feedback.jsonl").open("a") as fh:
+        fh.write(json.dumps({"iteration": state["iteration"], "text": text.strip(),
+                             "ts": now_iso(), "consumed": False}) + "\n")
+    print(f"queued feedback for the next iteration of {args.slug}")
+    return 0
+
+
+def cmd_show(args) -> int:
+    """Print just one file's diff or content, so review stays cheap."""
+    state = load_state(args.slug)
+    sbx = Path(state["sandbox"])
+    path = args.path
+
+    if args.diff:
+        git(sbx, "add", "-A", "-N")
+        r = git(sbx, "diff", "--no-color", "--", path)
+        out = r.stdout
+    else:
+        p = (sbx / path).resolve()
+        if not str(p).startswith(str(sbx.resolve())):
+            die("path escapes the sandbox")
+        out = p.read_text(errors="replace") if p.exists() else ""
+    lines = out.splitlines()
+    cap = args.max_lines
+    if len(lines) > cap:
+        print("\n".join(lines[:cap]))
+        print(f"… ({len(lines) - cap} more lines)")
+    else:
+        print(out.rstrip("\n"))
+    return 0
+
+
+def cmd_accept(args) -> int:
+    state = load_state(args.slug)
+    tdir = task_dir(args.slug)
+    sbx = Path(state["sandbox"])
+
+    git(sbx, "add", "-A")
+    msg = args.message or f"agy-loop: {args.slug}"
+    r = git(sbx, "commit", "-m", msg)
+    if r.returncode != 0 and "nothing to commit" not in (r.stdout + r.stderr):
+        die(f"commit failed:\n{r.stderr}")
+
+    stat = git(sbx, "diff", "--stat", "HEAD~1", "HEAD").stdout.strip()
+    state["status"] = "accepted"
+    save_state(args.slug, state)
+
+    print(f"committed on branch `{state.get('branch')}` in {sbx}\n")
+    print(stat or "(empty commit)")
+    print("\nGemini tokens this task: "
+          f"{state['tokens']['total']:,}")
+
+    if state.get("mode") == "worktree":
+        print(f"\nmerge it:\n  git -C {state['source']} merge {state['branch']}")
+        print(f"drop it:\n  agy-loop clean {args.slug} --force")
+    else:
+        patch_path = tdir / "accepted.patch"
+        patch_path.write_text(git(sbx, "format-patch", "-1", "--stdout").stdout)
+        print("\nsource was not a git repo, so nothing was merged.")
+        print(f"patch written to {patch_path}")
+        print(f"apply with:\n  git -C {state['source']} apply {patch_path}")
+    return 0
+
+
+def cmd_clean(args) -> int:
+    state = load_state(args.slug)
+    sbx = Path(state["sandbox"])
+    if not args.force:
+        die("refusing to remove a sandbox without --force")
+    if state.get("mode") == "worktree":
+        git(Path(state["source"]), "worktree", "remove", "--force", str(sbx))
+    elif sbx.exists():
+        shutil.rmtree(sbx, ignore_errors=True)
+    print(f"removed sandbox for {args.slug}")
+    return 0
+
+
+def cmd_config(args) -> int:
+    state = load_state(args.slug)
+    if args.max_iter is not None:
+        state["max_iter"] = args.max_iter
+    if args.model:
+        state["model"] = args.model
+    if args.status:
+        state["status"] = args.status
+    save_state(args.slug, state)
+    print(json.dumps({k: state[k] for k in ("slug", "model", "max_iter", "status",
+                                            "iteration", "tokens")}, indent=2))
+    return 0
+
+
+def cmd_status(args) -> int:
+    state = load_state(args.slug)
+    ledger = []
+    lp = task_dir(args.slug) / "ledger.jsonl"
+    if lp.exists():
+        ledger = [json.loads(l) for l in lp.read_text().splitlines() if l.strip()]
+    print(json.dumps({
+        "slug": state["slug"], "status": state["status"],
+        "iteration": f"{state['iteration']}/{state['max_iter']}",
+        "model": state["model"], "sandbox": state["sandbox"],
+        "gemini_tokens": state["tokens"]["total"],
+        "runs": [{"iter": r["iter"], "tokens": r["total"], "verify": r["verify_exit"]}
+                 for r in ledger[-5:]],
+    }, indent=2))
+    return 0
+
+
+def cmd_list(args) -> int:
+    if not TASKS.exists() or not any(TASKS.iterdir()):
+        print("no tasks yet")
+        return 0
+    for d in sorted(TASKS.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        sp = d / "state.json"
+        if not sp.exists():
+            continue
+        s = json.loads(sp.read_text())
+        print(f"{s['slug']:<28} {s['status']:<13} "
+              f"iter {s['iteration']}/{s['max_iter']}  "
+              f"{s['tokens']['total']:>9,} tok  {s['model']}")
+    return 0
+
+
+def cmd_recon(args) -> int:
+    """One-shot compact map of a repo, so Claude never has to read the code itself."""
+    target = Path(args.path).expanduser().resolve()
+    if not target.is_dir():
+        die(f"not a directory: {target}")
+    tmp = HOME / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    schema = tmp / "recon-schema.json"
+    schema.write_text(json.dumps(RECON_SCHEMA, indent=2))
+
+    prompt = (
+        "Map this repository for a reviewer who will not open the files. Be terse "
+        "and concrete. Do not modify anything.\n\n"
+        "Budget: read at most 20 files, chosen by name and manifest. Prefer "
+        "manifests, entrypoints, routing/config files, and one representative "
+        "module. Do not read vendored, generated, or dependency directories. "
+        "Only run a command if you must to identify the real test command.\n\n"
+        "Return: one-paragraph summary; the stack; a layout of the 10-20 most "
+        "important paths with a 5-word role each; real entrypoints; the exact test "
+        "command that actually works here; and the areas a change would most "
+        "likely break."
+    )
+    data = call_agy({"sandbox": str(target), "model": args.model or DEFAULT_MODEL,
+                     "sandboxed": False}, prompt, schema, args.timeout)
+    rep = data.get("structured_output") or {}
+    print(json.dumps(rep, indent=2))
+    u = data.get("usage", {})
+    print(f"\n# recon spend: {u.get('total_tokens', 0):,} Gemini tokens",
+          file=sys.stderr)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="agy-loop",
+                                 description="Claude plans, Gemini works, Claude reviews.")
+    ap.add_argument("--version", action="version", version=f"agy-loop {__version__}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("new", help="create task + isolated sandbox")
+    p.add_argument("slug")
+    p.add_argument("--source", default=".", help="directory to work on")
+    p.add_argument("--model", default=None)
+    p.add_argument("--max-iter", type=int, default=DEFAULT_MAX_ITER)
+    p.add_argument("--force-copy", action="store_true",
+                   help="copy instead of using a git worktree")
+    p.add_argument("--no-link-deps", action="store_true")
+    p.add_argument("--include-dirty", action="store_true",
+                   help="copy uncommitted and untracked files into the worktree")
+    p.set_defaults(func=cmd_new)
+
+    p = sub.add_parser("step", help="run one Gemini iteration and write a review packet")
+    p.add_argument("slug")
+    p.add_argument("--model", default=None)
+    p.add_argument("--max-diff", type=int, default=DIFF_CAP)
+    p.add_argument("--timeout", type=int, default=900)
+    p.add_argument("--verify-timeout", type=int, default=600)
+    p.add_argument("--skip-verify", action="store_true")
+    p.add_argument("--no-sandbox", action="store_true")
+    p.add_argument("--resume", action="store_true",
+                   help="continue the previous Gemini conversation (costs more tokens)")
+    p.set_defaults(func=cmd_step)
+
+    p = sub.add_parser("feedback", help="queue reviewer feedback for the next iteration")
+    p.add_argument("slug")
+    p.add_argument("text", nargs="?")
+    p.add_argument("--file", default=None)
+    p.set_defaults(func=cmd_feedback)
+
+    p = sub.add_parser("show", help="print one file's diff or content from the sandbox")
+    p.add_argument("slug")
+    p.add_argument("path")
+    p.add_argument("--diff", action="store_true")
+    p.add_argument("--max-lines", type=int, default=200)
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("accept", help="commit the sandbox and print merge instructions")
+    p.add_argument("slug")
+    p.add_argument("--message", "-m", default=None)
+    p.set_defaults(func=cmd_accept)
+
+    p = sub.add_parser("clean", help="remove the sandbox")
+    p.add_argument("slug")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_clean)
+
+    p = sub.add_parser("config", help="change model, iteration cap, status")
+    p.add_argument("slug")
+    p.add_argument("--max-iter", type=int, default=None)
+    p.add_argument("--model", default=None)
+    p.add_argument("--status", default=None)
+    p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("status", help="show one task")
+    p.add_argument("slug")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("list", help="list tasks")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("recon", help="one-shot compact repo map (no Claude reading)")
+    p.add_argument("path", nargs="?", default=".")
+    p.add_argument("--model", default=None)
+    p.add_argument("--timeout", type=int, default=600)
+    p.set_defaults(func=cmd_recon)
+
+    args = ap.parse_args()
+    HOME.mkdir(parents=True, exist_ok=True)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
