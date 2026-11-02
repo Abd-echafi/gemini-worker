@@ -43,9 +43,11 @@ cd gemini-worker
 ./install.sh
 ```
 
-That symlinks `bin/agy-loop` into `~/.local/bin` and the skill into
-`~/.claude/skills/gemini-worker/`. Re-run it after `git pull` — both entries are
-symlinks, so updates land automatically.
+That symlinks `bin/agy-loop` into `~/.local/bin`, and creates
+`~/.claude/skills/gemini-worker/` with `SKILL.md` symlinked from the checkout.
+Re-run it after `git pull` — both entries point into the repo, so updates land
+automatically. Existing files are only replaced with `--force`, and are backed
+up first.
 
 Manual install:
 
