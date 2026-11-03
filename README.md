@@ -77,6 +77,9 @@ agy-loop clean my-task --force
 | `new <slug> --source DIR` | Task + isolated worktree on branch `agy/<slug>` |
 | `step <slug>` | One Gemini iteration, writes `review-NN.md` |
 | `run <slug...> [--jobs N]` | Step several independent tasks concurrently |
+| `split <parent> [--parts N]` | Gemini proposes a disjoint split; writes `split.json` |
+| `fan <parent> [--jobs N] [--dry-run]` | Create a task per part and build them in parallel |
+| `merge <parent>` | Merge accepted children into an integration task |
 | `feedback <slug> "text"` | Queue a note for the next iteration |
 | `show <slug> <path> [--diff]` | One file, capped, for targeted review |
 | `accept <slug> -m msg` | Commit in the sandbox, print merge command |
@@ -150,6 +153,49 @@ Notes:
   cannot collide with a batch run — it exits 4 instead of corrupting state.
 - Flags (`--model`, `--skip-verify`, `--no-sandbox`, `--resume`, timeouts) are
   forwarded to every child. Full logs land in each task's `history/run-*.log`.
+
+## Fan-out: one feature, several workers
+
+`run` needs one brief per task. Fan-out splits **one** brief into independent
+parts, builds them at the same time, then integrates.
+
+```bash
+agy-loop new pdf-export --source ~/code/app
+$EDITOR ~/.agy-loop/tasks/pdf-export/brief.md
+
+agy-loop split pdf-export --parts 3        # Gemini proposes split.json
+cat ~/.agy-loop/tasks/pdf-export/split.json # read it: ownership must be disjoint
+
+agy-loop fan pdf-export --dry-run          # create children + briefs, no spend
+agy-loop fan pdf-export --jobs 3           # build every part at once
+
+agy-loop accept pdf-export-<part> -m "..." # one per child that passed
+agy-loop merge pdf-export
+agy-loop step pdf-export-integrate
+```
+
+`split` and `fan` enforce the rules a parallel split has to obey:
+
+- **Every file appears in exactly one part.** An overlap is a hard error.
+- **Parts must build and test alone.** Anything interdependent belongs in one part.
+- **Each generated gate has a scope guard** that fails if the child changed a
+  file outside its list — including newly created files.
+
+`merge` does the mechanical half: it merges each accepted child branch into
+`<parent>-integrate` as its own merge commit. A branch that conflicts is
+**aborted** and listed in the integration brief, so Gemini resolves it instead
+of the harness leaving a half-merged tree. The integration gate is the union of
+every part's checks plus `integration_gate` from the split, and it fails if
+conflict markers remain.
+
+**Use it for** per-module work, tests written alongside code, mechanical
+refactors across disjoint files. **Do not use it** when the parts share a file —
+a router, a schema, a barrel export, a lockfile. Two parts editing one file
+cannot be merged mechanically, and the integration step becomes the whole task.
+
+Costs: the split is one extra Gemini call, each part carries its own ~10k fixed
+overhead, and integration is one more call. The parent task itself is never
+stepped — it holds the brief, `split.json` and `fan.json`.
 
 ## Layout
 

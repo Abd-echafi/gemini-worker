@@ -146,6 +146,44 @@ call carries ~10k Gemini tokens of fixed overhead, so `--jobs 2` or `3` is
 usually the sweet spot. `--stop-on-fail` stops starting new tasks after the
 first non-passing one.
 
+### Fan-out: one feature, several workers
+
+When one brief splits into independent parts, do not write N briefs by hand.
+Let Gemini propose the split, then **review the split itself** — it is the plan,
+and a bad one costs more than it saves.
+
+```bash
+agy-loop split <parent> --parts 3    # writes split.json and prints it
+agy-loop fan <parent> --dry-run      # children + generated briefs, no spend
+agy-loop fan <parent> --jobs 3       # build every part at once
+```
+
+Read `split.json` before `fan`:
+
+- files must be disjoint across parts. `split` hard-errors on an exact overlap,
+  and a part list that shares one file is a rewrite, not a review note;
+- parts must build and test without each other. If two depend on each other,
+  merge them into one part in `split.json`;
+- never let parts share a router, schema, barrel export or lockfile. Those merge
+  badly and the integration step swallows the task.
+
+Each child gets a generated `verify.sh`: its own commands plus a scope guard that
+fails if it touched a file outside its list. Send the packet back through
+`feedback` like any other task.
+
+Then accept what passed, and integrate:
+
+```bash
+agy-loop accept <parent>-<part> -m "..."
+agy-loop merge <parent>              # merges children, defers conflicts
+agy-loop step <parent>-integrate
+```
+
+`merge` merges clean children mechanically and aborts any conflicting one,
+naming it in the integration brief. Gemini resolves those, then the union gate
+(every part's checks plus `integration_gate`, and no leftover conflict markers)
+must pass. Judge the integration packet, not the child diffs again.
+
 ### 5. Accept
 
 ```bash

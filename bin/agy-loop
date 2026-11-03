@@ -30,7 +30,7 @@ try:
 except ImportError:  # Windows: locking degrades to a no-op
     fcntl = None
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 HOME = Path(os.environ.get("AGY_LOOP_HOME", Path.home() / ".agy-loop"))
 TASKS = HOME / "tasks"
@@ -80,6 +80,30 @@ RECON_SCHEMA = {
         "risky_areas": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["summary", "stack", "layout", "test_command"],
+}
+
+SPLIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "parts": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "slug": {"type": "string"},
+                    "goal": {"type": "string"},
+                    "files": {"type": "array", "items": {"type": "string"}},
+                    "verify": {"type": "array", "items": {"type": "string"}},
+                    "notes": {"type": "string"},
+                },
+                "required": ["slug", "goal", "files"],
+            },
+        },
+        "integration_gate": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["summary", "parts"],
 }
 
 BRIEF_TEMPLATE = """# Brief: {slug}
@@ -751,6 +775,312 @@ def cmd_run(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- fan-out
+
+def _validate_split(parts: list[dict]) -> None:
+    """Reject a split that cannot be built in parallel."""
+    if len(parts) < 2:
+        die("a split needs at least 2 parts")
+    owner: dict[str, str] = {}
+    for p in parts:
+        slug = p.get("slug") or "?"
+        if not p.get("goal") or not p.get("files"):
+            die(f"part {slug!r} needs a goal and a non-empty files list")
+        for f in p["files"]:
+            if f in owner:
+                die(f"file owned by two parts: {f} ({owner[f]} and {slug})")
+            owner[f] = slug
+    for a in owner:
+        for b in owner:
+            if a != b and b.startswith(a.rstrip("/") + "/"):
+                print(f"warning: {a} is a prefix of {b}; the scope guard compares "
+                      "exact paths", file=sys.stderr)
+
+
+def _child_slug(parent: str, part: dict, taken: set[str]) -> str:
+    base = slugify(f"{parent}-{part.get('slug') or part['goal'][:24]}")
+    slug, n = base, 2
+    while slug in taken:
+        slug = f"{base}-{n}"
+        n += 1
+    taken.add(slug)
+    return slug
+
+
+def _scope_guard(files: list[str]) -> list[str]:
+    """Bash that fails if anything outside `files` changed."""
+    return [
+        "# make new files visible to git diff",
+        "git add -A -N >/dev/null 2>&1 || true",
+        "allowed=$(mktemp)",
+        'printf "%s\\n" "${allowed_files[@]}" > "$allowed"',
+        "changed=$(git diff --name-only HEAD || true)",
+        'bad=$(printf "%s\\n" "$changed" | grep -vxF -f "$allowed" | sed "/^$/d" || true)',
+        'rm -f "$allowed"',
+        "if [ -n \"$bad\" ]; then",
+        '  echo "out-of-scope files changed:" >&2',
+        '  printf "%s\\n" "$bad" >&2',
+        "  exit 1",
+        "fi",
+    ]
+
+
+def _write_child_files(parent: str, parts: list[dict], child: dict) -> None:
+    part, slug = child["part"], child["slug"]
+    tdir = task_dir(slug)
+    others = sorted({f for p in parts if p is not part for f in p["files"]})
+    cmds = part.get("verify") or []
+    scope = "\n".join(f"- `{f}`" for f in part["files"])
+    outside = "\n".join(f"- `{f}`" for f in others) or "- (nothing)"
+    checks = "\n".join(f"- [ ] `{c}` exits 0" for c in cmds) or "- [ ] the change is complete"
+    gate_text = "\n".join(f"  {c}" for c in cmds) or "  (no commands)"
+
+    (tdir / "brief.md").write_text(f"""# Brief: {slug}
+
+## Goal
+{part['goal'].strip()}
+
+This is part {child['index']} of {len(parts)} of a parallel fan-out of
+`{parent}`. The other parts are being built at the same time in separate
+worktrees. You own only the files listed below.
+
+## Scope
+- In scope — the only files you may create or modify:
+{scope}
+- Out of scope — owned by other parts, do not touch:
+{outside}
+
+## Acceptance criteria
+{checks}
+- [ ] `git diff --name-only HEAD` lists only files from the in-scope list
+
+## Constraints
+- Do not touch files owned by other parts, even to "fix" them.
+- Do not run `git commit`.
+- Follow the conventions already used in the files you touch.
+
+## Verification
+The gate runs:
+```
+{gate_text}
+```
+plus a scope check that fails if anything outside the in-scope list changed.
+""")
+
+    gate = ["#!/usr/bin/env bash", f"# Gate for {slug}", "set -euo pipefail", ""]
+    gate += cmds + [""] if cmds else []
+    gate += ["allowed_files=("] + [f'  "{f}"' for f in part["files"]] + [")"]
+    gate += _scope_guard(part["files"])
+    (tdir / "verify.sh").write_text("\n".join(gate) + "\n")
+
+
+def cmd_split(args) -> int:
+    """Ask Gemini for a disjoint split of the parent brief. Nothing is created yet."""
+    state = load_state(args.parent)
+    tdir = task_dir(args.parent)
+    sbx = Path(state["sandbox"])
+    brief_p = tdir / "brief.md"
+    if not brief_p.exists():
+        die("parent brief.md missing")
+    brief = brief_p.read_text()
+    if "<!-- One paragraph." in brief:
+        die("parent brief.md is still the template; write it first")
+
+    out = tdir / "split.json"
+    if out.exists() and not args.force:
+        die(f"split.json already exists (pass --force to overwrite): {out}")
+
+    schema = tdir / "split-schema.json"
+    schema.write_text(json.dumps(SPLIT_SCHEMA, indent=2))
+    prompt = (
+        "You are planning a parallel implementation. Read the repository and the "
+        f"brief, then split the work into about {args.parts} parts that can be "
+        "implemented at the same time by separate workers.\n\n"
+        "Rules:\n"
+        "- Each part must own a DISJOINT set of files. No file may appear in two parts.\n"
+        "- Parts must not need each other's output to build or test. If two pieces "
+        "depend on each other, make them one part.\n"
+        "- Fewer, larger parts beat many overlapping ones. Do not invent busywork.\n"
+        "- List every file the part will create or modify, repo-relative. List files "
+        "that do not exist yet too, if the part must create them.\n"
+        "- Give each part shell commands that prove it works (test file, typecheck, lint).\n"
+        "- integration_gate: commands that must pass once every part is merged.\n\n"
+        "## Brief\n" + brief.strip()
+    )
+    print(f"[{args.parent}] asking for a {args.parts}-part split …", file=sys.stderr)
+    data = call_agy({"sandbox": str(sbx), "model": args.model or state["model"],
+                     "sandboxed": True}, prompt, schema, args.timeout)
+    plan = data.get("structured_output") or {}
+    parts = plan.get("parts") or []
+    _validate_split(parts)
+
+    out.write_text(json.dumps(plan, indent=2) + "\n")
+    print(json.dumps(plan, indent=2))
+    usage = data.get("usage", {}) or {}
+    print(f"\nsplit spend: {usage.get('total_tokens', 0):,} Gemini tokens",
+          file=sys.stderr)
+    print(f"wrote {out}")
+    print("review it, edit it if the ownership is wrong, then run: "
+          f"agy-loop fan {args.parent}")
+    return 0
+
+
+def cmd_fan(args) -> int:
+    """Create one task per part from split.json and step them in parallel."""
+    pstate = load_state(args.parent)
+    tdir = task_dir(args.parent)
+    split_p = tdir / "split.json"
+    if not split_p.exists():
+        die(f"no split.json; run `agy-loop split {args.parent}` and review it first")
+    plan = json.loads(split_p.read_text())
+    parts = plan["parts"]
+    _validate_split(parts)
+
+    taken: set[str] = set()
+    children = []
+    for i, part in enumerate(parts, 1):
+        children.append({"slug": _child_slug(args.parent, part, taken),
+                         "part": part, "index": i})
+
+    existing = [c["slug"] for c in children if state_path(c["slug"]).exists()]
+    if existing and len(existing) != len(children):
+        die("some children already exist: " + ", ".join(existing)
+            + " (clean them or use a fresh parent)")
+    if existing:
+        print(f"reusing {len(existing)} existing child task(s); briefs are left "
+              "as they are", file=sys.stderr)
+    else:
+        for child in children:
+            print(f"[{child['slug']}] creating sandbox", file=sys.stderr)
+            cmd_new(argparse.Namespace(
+                slug=child["slug"], source=pstate["source"],
+                model=args.model or pstate["model"], max_iter=args.max_iter,
+                force_copy=pstate.get("mode") != "worktree",
+                no_link_deps=False, include_dirty=args.include_dirty))
+            _write_child_files(args.parent, parts, child)
+
+    (tdir / "fan.json").write_text(json.dumps({
+        "parent": args.parent, "created": now_iso(),
+        "integration": slugify(f"{args.parent}-integrate"),
+        "children": [{"slug": c["slug"], "part": c["part"]} for c in children],
+    }, indent=2) + "\n")
+
+    if args.dry_run:
+        print(f"\ncreated {len(children)} child task(s); no work started")
+        print(f"review each brief under {tdir.parent}/<slug>/brief.md, then run: "
+              f"agy-loop fan {args.parent}")
+        return 0
+
+    jobs = args.jobs if args.jobs else min(3, len(children))
+    print(f"\nfanned {args.parent} into {len(children)} part(s), {jobs} at a time",
+          file=sys.stderr)
+    rc = cmd_run(argparse.Namespace(
+        slugs=[c["slug"] for c in children], jobs=jobs, model=args.model,
+        max_diff=DIFF_CAP, timeout=args.timeout, verify_timeout=args.verify_timeout,
+        skip_verify=args.skip_verify, no_sandbox=args.no_sandbox, resume=False,
+        stop_on_fail=args.stop_on_fail))
+
+    print(f"\nwhen every child passes: agy-loop accept <slug> -m \"...\" for each, "
+          f"then agy-loop merge {args.parent}")
+    return rc
+
+
+def cmd_merge(args) -> int:
+    """Merge accepted children into an integration task, deferring conflicts."""
+    pstate = load_state(args.parent)
+    tdir = task_dir(args.parent)
+    split_p, fan_p = tdir / "split.json", tdir / "fan.json"
+    if not fan_p.exists():
+        die(f"no fan.json; run `agy-loop fan {args.parent}` first")
+    fan = json.loads(fan_p.read_text())
+    plan = json.loads(split_p.read_text())
+
+    blocked = []
+    for c in fan["children"]:
+        st = load_state(c["slug"])
+        if st["status"] != "accepted":
+            blocked.append(f"{c['slug']} ({st['status']})")
+    if blocked:
+        die("every child must be accepted first:\n  " + "\n  ".join(blocked))
+
+    islug = fan.get("integration") or slugify(f"{args.parent}-integrate")
+    if not state_path(islug).exists():
+        print(f"[{islug}] creating integration sandbox", file=sys.stderr)
+        cmd_new(argparse.Namespace(
+            slug=islug, source=pstate["source"], model=pstate["model"],
+            max_iter=args.max_iter, force_copy=pstate.get("mode") != "worktree",
+            no_link_deps=False, include_dirty=False))
+    istate = load_state(islug)
+    sbx = Path(istate["sandbox"])
+
+    merged, deferred = [], []
+    for c in fan["children"]:
+        branch = load_state(c["slug"]).get("branch") or f"agy/{c['slug']}"
+        r = git(sbx, "merge", "--no-ff", "-m", f"merge {c['slug']}", branch)
+        if r.returncode == 0:
+            merged.append(branch)
+            print(f"  merged {branch}")
+        else:
+            git(sbx, "merge", "--abort")
+            deferred.append((c["slug"], branch))
+            print(f"  conflict: {branch} — left for the integrator", file=sys.stderr)
+
+    # union gate: every child's commands plus the planned integration gate
+    cmds: list[str] = []
+    for c in fan["children"]:
+        for cmd in c["part"].get("verify") or []:
+            if cmd not in cmds:
+                cmds.append(cmd)
+    for cmd in plan.get("integration_gate") or []:
+        if cmd not in cmds:
+            cmds.append(cmd)
+
+    merged_txt = "\n".join(f"- `{b}`" for b in merged) or "- (none)"
+    deferred_txt = "\n".join(f"- `{b}` ({slug})" for slug, b in deferred) or "- (none)"
+    (task_dir(islug) / "brief.md").write_text(f"""# Brief: {islug}
+
+## Goal
+Integrate the parallel parts of `{args.parent}` into one working branch. When
+this is done the union gate passes and no part's behaviour is lost.
+
+## Already merged
+{merged_txt}
+
+## Still to merge (conflicts)
+{deferred_txt}
+
+For each branch in that list: run `git merge <branch>`, resolve the conflicts by
+understanding both sides, then remove the markers. Do not drop either side's
+intent; if the two changes are incompatible, choose the one that keeps the union
+gate passing and record the decision.
+
+## Scope
+- Fix conflicts, import wiring, and anything the merge broke.
+- Do not redesign or add features. Do not touch files to "clean them up".
+
+## Acceptance criteria
+- [ ] every branch above is merged
+- [ ] the gate passes
+- [ ] no conflict markers remain (`git grep -n '^<<<<<<<'` is empty)
+
+## Verification
+The gate runs the union of every part's checks:
+```
+{chr(10).join(f"  {c}" for c in cmds) or "  (no commands)"}
+```
+""")
+
+    gate = ["#!/usr/bin/env bash", f"# Union gate for {islug}", "set -euo pipefail", ""]
+    gate += cmds + [""]
+    gate += ["if git grep -n '^<<<<<<<' -- . ':!*.md' >/dev/null 2>&1; then",
+             '  echo "conflict markers remain" >&2', "  exit 1", "fi"]
+    (task_dir(islug) / "verify.sh").write_text("\n".join(gate) + "\n")
+
+    print(f"\nintegrated {len(merged)} branch(es); {len(deferred)} deferred")
+    print(f"next: agy-loop step {islug}")
+    return 0
+
+
 def cmd_feedback(args) -> int:
     tdir = task_dir(args.slug)
     state = load_state(args.slug)
@@ -799,10 +1129,11 @@ def cmd_accept(args) -> int:
     git(sbx, "add", "-A")
     msg = args.message or f"agy-loop: {args.slug}"
     r = git(sbx, "commit", "-m", msg)
-    if r.returncode != 0 and "nothing to commit" not in (r.stdout + r.stderr):
+    committed = r.returncode == 0
+    if not committed and "nothing to commit" not in (r.stdout + r.stderr):
         die(f"commit failed:\n{r.stderr}")
 
-    stat = git(sbx, "diff", "--stat", "HEAD~1", "HEAD").stdout.strip()
+    stat = git(sbx, "diff", "--stat", "HEAD~1", "HEAD").stdout.strip() if committed else ""
     state["status"] = "accepted"
     save_state(args.slug, state)
 
@@ -958,6 +1289,35 @@ def main() -> int:
     p.add_argument("--stop-on-fail", action="store_true",
                    help="stop starting new tasks once one does not pass")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("split", help="propose a disjoint fan-out split with Gemini")
+    p.add_argument("parent")
+    p.add_argument("--parts", type=int, default=3)
+    p.add_argument("--model", default=None)
+    p.add_argument("--timeout", type=int, default=600)
+    p.add_argument("--force", action="store_true", help="overwrite an existing split.json")
+    p.set_defaults(func=cmd_split)
+
+    p = sub.add_parser("fan", help="create child tasks from split.json and run them")
+    p.add_argument("parent")
+    p.add_argument("--jobs", "-j", type=int, default=None,
+                   help="parallel children (default: min(3, number of parts))")
+    p.add_argument("--model", default=None)
+    p.add_argument("--max-iter", type=int, default=3)
+    p.add_argument("--timeout", type=int, default=900)
+    p.add_argument("--verify-timeout", type=int, default=600)
+    p.add_argument("--skip-verify", action="store_true")
+    p.add_argument("--no-sandbox", action="store_true")
+    p.add_argument("--include-dirty", action="store_true")
+    p.add_argument("--stop-on-fail", action="store_true")
+    p.add_argument("--dry-run", action="store_true",
+                   help="create the child tasks and stop, so briefs can be reviewed")
+    p.set_defaults(func=cmd_fan)
+
+    p = sub.add_parser("merge", help="merge accepted children into an integration task")
+    p.add_argument("parent")
+    p.add_argument("--max-iter", type=int, default=3)
+    p.set_defaults(func=cmd_merge)
 
     p = sub.add_parser("feedback", help="queue reviewer feedback for the next iteration")
     p.add_argument("slug")
