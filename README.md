@@ -76,6 +76,7 @@ agy-loop clean my-task --force
 |---|---|
 | `new <slug> --source DIR` | Task + isolated worktree on branch `agy/<slug>` |
 | `step <slug>` | One Gemini iteration, writes `review-NN.md` |
+| `run <slug...> [--jobs N]` | Step several independent tasks concurrently |
 | `feedback <slug> "text"` | Queue a note for the next iteration |
 | `show <slug> <path> [--diff]` | One file, capped, for targeted review |
 | `accept <slug> -m msg` | Commit in the sandbox, print merge command |
@@ -109,6 +110,46 @@ Exit codes from `step`:
 | `2` | Gate failed |
 | `3` | Gemini reported blocked/partial, or the iteration cap is hit |
 | `4` | Harness or CLI error |
+
+## Parallel workers
+
+Several independent tasks can run at once:
+
+```bash
+agy-loop run auth-refactor add-tests docs-pass --jobs 3
+```
+
+Each task is a child process in its own sandbox, so state, locks and token
+ledgers stay independent. The parent starts at most `--jobs` at a time and ends
+with a summary:
+
+```
+task                         result      iter         tokens  packet
+--------------------------------------------------------------------------------------------
+auth-refactor                PASS        1/3          385,151  .../tasks/auth-refactor/review-01.md
+add-tests                    PASS        2/3          120,004  .../tasks/add-tests/review-02.md
+docs-pass                    FAIL        1/3           61,442  .../tasks/docs-pass/review-01.md
+
+batch total: 566,597 Gemini tokens across 3 task(s)
+```
+
+`run` exits `0` only if every task passed, `1` if any failed, was blocked or was
+not run, and `4` on a harness error.
+
+Notes:
+
+- **Independent work only.** Separate worktrees mean no on-disk contention, but
+  two tasks editing the same files still have to be merged, and duplicate work
+  is wasted tokens.
+- **`--jobs` defaults to 3.** Every `agy` call costs ~10k tokens of fixed
+  overhead before any real work, so an N-way fan-out multiplies that floor.
+  Start at 2–3 and watch the ledger.
+- **`--stop-on-fail`** stops starting new tasks after the first non-passing one;
+  tasks already running still finish.
+- **`step` holds an exclusive lock per task**, so a manual `agy-loop step`
+  cannot collide with a batch run — it exits 4 instead of corrupting state.
+- Flags (`--model`, `--skip-verify`, `--no-sandbox`, `--resume`, timeouts) are
+  forwarded to every child. Full logs land in each task's `history/run-*.log`.
 
 ## Layout
 

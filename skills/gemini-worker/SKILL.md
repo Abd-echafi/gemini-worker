@@ -28,6 +28,8 @@ adds a minute of latency per iteration.
   packet makes a specific doubt worth one targeted `agy-loop show`.
 - Verification is a shell script. It costs zero Claude tokens. Put every
   mechanical criterion in it instead of checking it yourself.
+- Parallel tasks multiply Gemini's fixed per-call overhead, not your review
+  cost. Review stays one packet per task; spend does not stay flat.
 
 ## Protocol
 
@@ -123,6 +125,26 @@ say why.
   packets, then read only the final one. Cheapest on Claude tokens. Stop early if
   exit 3 (blocked) appears twice, or if a gate failure repeats with an unchanged
   diff across two rounds.
+
+### Parallel tasks
+
+When the work splits into **independent** units, create one task per unit and
+step them together instead of looping one at a time:
+
+```bash
+agy-loop run slug-a slug-b slug-c --jobs 3
+```
+
+Each task runs as its own process in its own sandbox, so state and token
+ledgers stay independent. The parent prints one line per completion, then a
+summary of result, spend and packet path. Read each `review-NN.md` after — the
+same ~300-800 token budget per task.
+
+Only parallelize work that does not touch the same files. Separate worktrees
+prevent on-disk races, not merge conflicts or duplicated effort. Each concurrent
+call carries ~10k Gemini tokens of fixed overhead, so `--jobs 2` or `3` is
+usually the sweet spot. `--stop-on-fail` stops starting new tasks after the
+first non-passing one.
 
 ### 5. Accept
 

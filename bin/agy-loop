@@ -21,10 +21,16 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "1.0.0"
+try:
+    import fcntl
+except ImportError:  # Windows: locking degrades to a no-op
+    fcntl = None
+
+__version__ = "1.1.0"
 
 HOME = Path(os.environ.get("AGY_LOOP_HOME", Path.home() / ".agy-loop"))
 TASKS = HOME / "tasks"
@@ -199,6 +205,28 @@ def load_state(slug: str) -> dict:
 
 def save_state(slug: str, state: dict) -> None:
     state_path(slug).write_text(json.dumps(state, indent=2) + "\n")
+
+
+@contextmanager
+def task_lock(slug: str):
+    """Exclusive per-task lock, so two `step` calls can never race on state.
+
+    Safe to nest with `run`: the parent never holds it, only the children do.
+    """
+    if fcntl is None:
+        yield
+        return
+    p = task_dir(slug) / "state.lock"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            die(f"{slug} is already being stepped by another process")
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def tail(text: str, lines: int) -> str:
@@ -607,6 +635,122 @@ def cmd_step(args) -> int:
     return 0
 
 
+def _step_argv(slug: str, args) -> list[str]:
+    """Rebuild the child command line, forwarding only what was asked for."""
+    argv = [sys.executable, str(Path(__file__).resolve()), "step", slug]
+    if getattr(args, "model", None):
+        argv += ["--model", args.model]
+    if args.max_diff != DIFF_CAP:
+        argv += ["--max-diff", str(args.max_diff)]
+    if args.timeout != 900:
+        argv += ["--timeout", str(args.timeout)]
+    if args.verify_timeout != 600:
+        argv += ["--verify-timeout", str(args.verify_timeout)]
+    if args.skip_verify:
+        argv += ["--skip-verify"]
+    if args.no_sandbox:
+        argv += ["--no-sandbox"]
+    if args.resume:
+        argv += ["--resume"]
+    return argv
+
+
+def _packet_from_log(log: Path) -> str:
+    """The child announces `wrote <packet>`; trust that over guessing the name."""
+    try:
+        for line in reversed(log.read_text(errors="replace").splitlines()):
+            if line.startswith("wrote "):
+                return line[6:].strip()
+    except OSError:
+        pass
+    return "-"
+
+
+def cmd_run(args) -> int:
+    """Step several independent tasks at once, each in its own sandbox.
+
+    One child process per task, so state, locks and token ledgers stay
+    independent. Returns 0 only if every task passed its gate.
+    """
+    slugs = list(dict.fromkeys(args.slugs))
+    if len(slugs) != len(args.slugs):
+        die("duplicate slug in the task list")
+    for s in slugs:
+        if not state_path(s).exists():
+            die(f"no such task: {s} (try `agy-loop list`)")
+
+    jobs = max(1, min(args.jobs, len(slugs)))
+    before = {s: load_state(s)["tokens"]["total"] for s in slugs}
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    pending, running, results, logs = list(slugs), {}, {}, {}
+    failed = False
+
+    def start(slug: str) -> None:
+        log = task_dir(slug) / "history" / f"run-{stamp}.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        fh = log.open("w")
+        proc = subprocess.Popen(_step_argv(slug, args), stdout=fh,
+                                stderr=subprocess.STDOUT)
+        running[slug] = (proc, log, fh)
+        logs[slug] = log
+        print(f"[{slug}] started  ({len(running)}/{jobs} slots busy)", file=sys.stderr)
+
+    print(f"running {len(slugs)} task(s), {jobs} at a time", file=sys.stderr)
+    try:
+        while pending or running:
+            while pending and len(running) < jobs and not (failed and args.stop_on_fail):
+                start(pending.pop(0))
+            for slug, (proc, log, fh) in list(running.items()):
+                rc = proc.poll()
+                if rc is None:
+                    continue
+                fh.close()
+                del running[slug]
+                results[slug] = rc
+                label = {0: "passed", 2: "gate failed", 3: "blocked",
+                         4: "harness error"}.get(rc, f"exit {rc}")
+                print(f"[{slug}] {label}", file=sys.stderr)
+                if rc != 0:
+                    failed = True
+            if not running and pending and failed and args.stop_on_fail:
+                break
+            time.sleep(0.5)
+    finally:
+        for slug, (proc, log, fh) in running.items():
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            fh.close()
+            results.setdefault(slug, 4)
+
+    # ---- summary: one compact line per task, packets for the reviewer
+    print()
+    print(f"{'task':<28} {'result':<11} {'iter':<8} {'tokens':>10}  packet")
+    print("-" * 92)
+    total = 0
+    for s in slugs:
+        if s not in results:
+            print(f"{s:<28} {'not run':<11}")
+            continue
+        state = load_state(s)
+        spent = max(0, state["tokens"]["total"] - before[s])
+        total += spent
+        label = {0: "PASS", 2: "FAIL", 3: "BLOCKED", 4: "ERROR"}.get(
+            results[s], f"exit {results[s]}")
+        packet = _packet_from_log(logs[s])
+        print(f"{s:<28} {label:<11} {state['iteration']}/{state['max_iter']:<8}"
+              f"{spent:>10,}  {packet}")
+
+    print(f"\nbatch total: {total:,} Gemini tokens across {len(results)} task(s)")
+    if failed or len(results) < len(slugs):
+        print(f"full logs: {HOME}/tasks/<slug>/history/run-*.log")
+        return 1
+    return 0
+
+
 def cmd_feedback(args) -> int:
     tdir = task_dir(args.slug)
     state = load_state(args.slug)
@@ -800,6 +944,21 @@ def main() -> int:
                    help="continue the previous Gemini conversation (costs more tokens)")
     p.set_defaults(func=cmd_step)
 
+    p = sub.add_parser("run", help="step several independent tasks concurrently")
+    p.add_argument("slugs", nargs="+", help="task slugs to step")
+    p.add_argument("--jobs", "-j", type=int, default=3,
+                   help="how many tasks may run at once (default 3)")
+    p.add_argument("--model", default=None)
+    p.add_argument("--max-diff", type=int, default=DIFF_CAP)
+    p.add_argument("--timeout", type=int, default=900)
+    p.add_argument("--verify-timeout", type=int, default=600)
+    p.add_argument("--skip-verify", action="store_true")
+    p.add_argument("--no-sandbox", action="store_true")
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--stop-on-fail", action="store_true",
+                   help="stop starting new tasks once one does not pass")
+    p.set_defaults(func=cmd_run)
+
     p = sub.add_parser("feedback", help="queue reviewer feedback for the next iteration")
     p.add_argument("slug")
     p.add_argument("text", nargs="?")
@@ -845,6 +1004,9 @@ def main() -> int:
 
     args = ap.parse_args()
     HOME.mkdir(parents=True, exist_ok=True)
+    if args.cmd == "step":
+        with task_lock(args.slug):
+            return args.func(args)
     return args.func(args)
 
 
